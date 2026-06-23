@@ -1,0 +1,33 @@
+#!/bin/sh
+
+IFACE="enp2s0"
+NAS_IP="10.9.11.2"
+NAS_HOST="nac11.kku.ac.th"
+USERNAME="YOUR_NAME"
+PASSWORD="YOUR_PASSWORD"
+
+RESOLVE="--resolve ${NAS_HOST}:443:${NAS_IP}"
+
+STATUS=$(curl -s --interface "$IFACE" $RESOLVE \
+  -o /dev/null -w "%{http_code}" \
+  "https://${NAS_HOST}/status")
+
+if [ "$STATUS" = "200" ]; then
+  echo "Already authenticated"
+  exit 0
+fi
+
+RESPONSE=$(curl -s --interface "$IFACE" $RESOLVE \
+  -X POST "https://${NAS_HOST}/login?target=xml" \
+  --data-urlencode "username=$USERNAME" \
+  --data-urlencode "password=$PASSWORD" \
+  -d "dst=http://google.com")
+
+CODE=$(echo "$RESPONSE" | grep -o "ResponseCode>[0-9]*" | grep -o "[0-9]*" | head -1)
+
+if [ "$CODE" = "50" ]; then
+  echo "Authenticated successfully"
+else
+  echo "Auth failed (ResponseCode: $CODE)"
+  exit 1
+fi
