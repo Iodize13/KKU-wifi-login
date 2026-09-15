@@ -1,33 +1,116 @@
 #!/bin/sh
+# Auto-login to KKU wifi captive portal from any campus location.
+# Each building's access point is fronted by its own NAC controller
+# (nac01.kku.ac.th .. nac15.kku.ac.th); this tries the last one that
+# worked, then the rest, and stops at the first reachable from here.
 
-IFACE="enp2s0"
-NAS_IP="10.9.11.2"
-NAS_HOST="nac11.kku.ac.th"
-USERNAME="YOUR_NAME"
-PASSWORD="YOUR_PASSWORD"
+USERNAME="${KKU_USERNAME:-YOUR_NAME}"
+PASSWORD="${KKU_PASSWORD:-YOUR_PASSWORD}"
+SSID="${KKU_SSID:-kku-wifi}"
 
-RESOLVE="--resolve ${NAS_HOST}:443:${NAS_IP}"
+# Known NAC controllers run nac01 through nac15.
+NAS_HOSTS=""
+i=1
+while [ "$i" -le 15 ]; do
+  NAS_HOSTS="$NAS_HOSTS $(printf 'nac%02d.kku.ac.th' "$i")"
+  i=$((i + 1))
+done
 
-STATUS=$(curl -s --interface "$IFACE" $RESOLVE \
-  -o /dev/null -w "%{http_code}" \
-  "https://${NAS_HOST}/status")
+CONNECT_TIMEOUT=3
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}"
+STATE_FILE="$STATE_DIR/kku-wifi-login-last-nac"
+mkdir -p "$STATE_DIR" 2>/dev/null
 
-if [ "$STATUS" = "200" ]; then
-  echo "Already authenticated"
+# On NetworkManager machines, join the campus SSID first unless already
+# on a kku-wifi* network. Other setups are left alone.
+nm_connect() {
+  command -v nmcli >/dev/null 2>&1 || return 0
+  [ "$(nmcli -t -f RUNNING general 2>/dev/null)" = "running" ] || return 0
+
+  if nmcli -t -f ACTIVE,SSID device wifi list --rescan no 2>/dev/null | grep -q '^yes:kku-wifi'; then
+    return 0
+  fi
+
+  echo "Connecting to $SSID via NetworkManager..."
+  nmcli connection up id "$SSID" >/dev/null 2>&1 \
+    || nmcli device wifi connect "$SSID" >/dev/null 2>&1 \
+    || echo "Could not connect to $SSID, trying current network anyway" >&2
+}
+
+iface() {
+  ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}'
+}
+
+resolve() {
+  host -t A "$1" 2>/dev/null | awk '/has address/ {print $NF; exit}'
+}
+
+try_login() {
+  NAS_HOST="$1"
+  NAS_IP=$(resolve "$NAS_HOST")
+  if [ -z "$NAS_IP" ]; then
+    echo "  $NAS_HOST: cannot resolve, skipping"
+    return 1
+  fi
+
+  RESOLVE="--resolve ${NAS_HOST}:443:${NAS_IP}"
+
+  STATUS=$(curl -sk --interface "$IFACE" $RESOLVE --connect-timeout "$CONNECT_TIMEOUT" \
+    -o /dev/null -w "%{http_code}" \
+    "https://${NAS_HOST}/status")
+
+  if [ "$STATUS" = "200" ]; then
+    echo "Already authenticated via $NAS_HOST ($NAS_IP)"
+    echo "$NAS_HOST" > "$STATE_FILE" 2>/dev/null
+    return 0
+  fi
+
+  if [ -z "$STATUS" ] || [ "$STATUS" = "000" ]; then
+    echo "  $NAS_HOST ($NAS_IP): unreachable, skipping"
+    return 1
+  fi
+
+  RESPONSE=$(curl -sk --interface "$IFACE" $RESOLVE --connect-timeout "$CONNECT_TIMEOUT" \
+    -X POST "https://${NAS_HOST}/login?target=xml" \
+    --data-urlencode "username=$USERNAME" \
+    --data-urlencode "password=$PASSWORD" \
+    -d "dst=http://google.com")
+
+  CODE=$(echo "$RESPONSE" | grep -o "ResponseCode>[0-9]*" | grep -o "[0-9]*" | head -1)
+
+  if [ "$CODE" = "50" ]; then
+    echo "Authenticated successfully via $NAS_HOST ($NAS_IP)"
+    echo "$NAS_HOST" > "$STATE_FILE" 2>/dev/null
+    return 0
+  fi
+
+  echo "  $NAS_HOST ($NAS_IP): auth failed (ResponseCode: $CODE)"
+  return 1
+}
+
+nm_connect
+
+IFACE=$(iface)
+if [ -z "$IFACE" ]; then
+  echo "Could not determine active network interface" >&2
+  exit 1
+fi
+
+LAST_NAS_HOST=""
+if [ -f "$STATE_FILE" ]; then
+  LAST_NAS_HOST=$(cat "$STATE_FILE" 2>/dev/null)
+fi
+
+if [ -n "$LAST_NAS_HOST" ] && try_login "$LAST_NAS_HOST"; then
   exit 0
 fi
 
-RESPONSE=$(curl -s --interface "$IFACE" $RESOLVE \
-  -X POST "https://${NAS_HOST}/login?target=xml" \
-  --data-urlencode "username=$USERNAME" \
-  --data-urlencode "password=$PASSWORD" \
-  -d "dst=http://google.com")
+for NAS_HOST in $NAS_HOSTS; do
+  [ "$NAS_HOST" = "$LAST_NAS_HOST" ] && continue
+  if try_login "$NAS_HOST"; then
+    exit 0
+  fi
+done
 
-CODE=$(echo "$RESPONSE" | grep -o "ResponseCode>[0-9]*" | grep -o "[0-9]*" | head -1)
-
-if [ "$CODE" = "50" ]; then
-  echo "Authenticated successfully"
-else
-  echo "Auth failed (ResponseCode: $CODE)"
-  exit 1
-fi
+echo "Auth failed at all known locations ($NAS_HOSTS)" >&2
+exit 1
