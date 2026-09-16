@@ -1,14 +1,18 @@
 #!/bin/sh
 # Auto-login to KKU wifi captive portal from any campus location.
 # Each building's access point is fronted by its own NAC controller
-# (nac01.kku.ac.th .. nac15.kku.ac.th); this tries the last one that
-# worked, then the rest, and stops at the first reachable from here.
+# (nac01.kku.ac.th .. nac15.kku.ac.th). All of them are routable from
+# inside the campus network and all of them will happily accept valid
+# credentials, but only the one gating this AP actually opens the
+# internet -- so ask the portal which one owns us instead of guessing,
+# and confirm we really got online before declaring success.
 
 USERNAME="${KKU_USERNAME:-YOUR_NAME}"
 PASSWORD="${KKU_PASSWORD:-YOUR_PASSWORD}"
 SSID="${KKU_SSID:-kku-wifi}"
 
-# Known NAC controllers run nac01 through nac15.
+# Known NAC controllers run nac01 through nac15. Only used as a fallback
+# when the portal redirect does not name one.
 NAS_HOSTS=""
 i=1
 while [ "$i" -le 15 ]; do
@@ -17,6 +21,11 @@ while [ "$i" -le 15 ]; do
 done
 
 CONNECT_TIMEOUT=3
+# Unauthenticated, this is what the portal intercepts; authenticated, it
+# is a 204 with an empty body. Must stay plain http -- a portal cannot
+# inject its redirect into a TLS session, so https would just fail here
+# instead of naming the controller.
+PROBE_URL="http://204.ecloud.global"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}"
 STATE_FILE="$STATE_DIR/kku-wifi-login-last-nac"
 mkdir -p "$STATE_DIR" 2>/dev/null
@@ -45,6 +54,22 @@ resolve() {
   host -t A "$1" 2>/dev/null | awk '/has address/ {print $NF; exit}'
 }
 
+# True once traffic actually leaves the network, i.e. the NAC in front of
+# this AP has a session for us.
+online() {
+  [ "$(curl -s --interface "$IFACE" --connect-timeout "$CONNECT_TIMEOUT" \
+    -o /dev/null -w '%{http_code}' "$PROBE_URL")" = "204" ]
+}
+
+# The NAC gating this AP is whichever host the portal bounces us to, in
+# the Location header or in a meta refresh / JS redirect in the body.
+detect_nas_host() {
+  curl -sk --interface "$IFACE" --connect-timeout "$CONNECT_TIMEOUT" \
+    -D - -o - "$PROBE_URL" 2>/dev/null \
+    | grep -oE 'nac[0-9]{2}\.kku\.ac\.th' \
+    | head -1
+}
+
 try_login() {
   NAS_HOST="$1"
   NAS_IP=$(resolve "$NAS_HOST")
@@ -55,37 +80,34 @@ try_login() {
 
   RESOLVE="--resolve ${NAS_HOST}:443:${NAS_IP}"
 
-  STATUS=$(curl -sk --interface "$IFACE" $RESOLVE --connect-timeout "$CONNECT_TIMEOUT" \
-    -o /dev/null -w "%{http_code}" \
-    "https://${NAS_HOST}/status")
-
-  if [ "$STATUS" = "200" ]; then
-    echo "Already authenticated via $NAS_HOST ($NAS_IP)"
-    echo "$NAS_HOST" > "$STATE_FILE" 2>/dev/null
-    return 0
-  fi
-
-  if [ -z "$STATUS" ] || [ "$STATUS" = "000" ]; then
-    echo "  $NAS_HOST ($NAS_IP): unreachable, skipping"
-    return 1
-  fi
-
   RESPONSE=$(curl -sk --interface "$IFACE" $RESOLVE --connect-timeout "$CONNECT_TIMEOUT" \
     -X POST "https://${NAS_HOST}/login?target=xml" \
     --data-urlencode "username=$USERNAME" \
     --data-urlencode "password=$PASSWORD" \
     -d "dst=http://google.com")
 
-  CODE=$(echo "$RESPONSE" | grep -o "ResponseCode>[0-9]*" | grep -o "[0-9]*" | head -1)
-
-  if [ "$CODE" = "50" ]; then
-    echo "Authenticated successfully via $NAS_HOST ($NAS_IP)"
-    echo "$NAS_HOST" > "$STATE_FILE" 2>/dev/null
-    return 0
+  if [ -z "$RESPONSE" ]; then
+    echo "  $NAS_HOST ($NAS_IP): unreachable, skipping"
+    return 1
   fi
 
-  echo "  $NAS_HOST ($NAS_IP): auth failed (ResponseCode: $CODE)"
-  return 1
+  CODE=$(echo "$RESPONSE" | grep -o "ResponseCode>[0-9]*" | grep -o "[0-9]*" | head -1)
+
+  if [ "$CODE" != "50" ]; then
+    echo "  $NAS_HOST ($NAS_IP): auth failed (ResponseCode: $CODE)"
+    return 1
+  fi
+
+  # Credentials are fine on every controller, so an accepted login only
+  # counts if this is the one actually gating our traffic.
+  if ! online; then
+    echo "  $NAS_HOST ($NAS_IP): accepted login but still no internet, wrong controller"
+    return 1
+  fi
+
+  echo "Authenticated successfully via $NAS_HOST ($NAS_IP)"
+  echo "$NAS_HOST" > "$STATE_FILE" 2>/dev/null
+  return 0
 }
 
 nm_connect
@@ -96,16 +118,28 @@ if [ -z "$IFACE" ]; then
   exit 1
 fi
 
+if online; then
+  echo "Already authenticated"
+  exit 0
+fi
+
+PORTAL_NAS_HOST=$(detect_nas_host)
+if [ -n "$PORTAL_NAS_HOST" ]; then
+  echo "Portal redirected us to $PORTAL_NAS_HOST"
+  try_login "$PORTAL_NAS_HOST" && exit 0
+fi
+
 LAST_NAS_HOST=""
 if [ -f "$STATE_FILE" ]; then
   LAST_NAS_HOST=$(cat "$STATE_FILE" 2>/dev/null)
 fi
 
-if [ -n "$LAST_NAS_HOST" ] && try_login "$LAST_NAS_HOST"; then
-  exit 0
+if [ -n "$LAST_NAS_HOST" ] && [ "$LAST_NAS_HOST" != "$PORTAL_NAS_HOST" ]; then
+  try_login "$LAST_NAS_HOST" && exit 0
 fi
 
 for NAS_HOST in $NAS_HOSTS; do
+  [ "$NAS_HOST" = "$PORTAL_NAS_HOST" ] && continue
   [ "$NAS_HOST" = "$LAST_NAS_HOST" ] && continue
   if try_login "$NAS_HOST"; then
     exit 0
